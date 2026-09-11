@@ -1,0 +1,43 @@
+{
+  "session_id": "20260911_081357",
+  "arm": "right",
+  "saved_at": "2026-09-11T08:14:31",
+  "calibration_points": {
+    "center": {
+      "x": 539,
+      "y": 513,
+      "sample_count": 8
+    },
+    "left": {
+      "x": 842,
+      "y": 576,
+      "sample_count": 8
+    },
+    "right": {
+      "x": 979,
+      "y": 333,
+      "sample_count": 8
+    },
+    "up": {
+      "x": 910,
+      "y": 362,
+      "sample_count": 8
+    },
+    "down": {
+      "x": 1054,
+      "y": 697,
+      "sample_count": 8
+    }
+  },
+  "workspace": {
+    "min_x": 842,
+    "max_x": 979,
+    "min_y": 362,
+    "max_y": 697,
+    "width": 137,
+    "height": 335,
+    "center_x": 539,
+    "center_y": 513
+  },
+  "note": "Interface comfort-workspace calibration; not a clinical joint-ROM measurement."
+}

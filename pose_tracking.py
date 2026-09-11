@@ -11,24 +11,50 @@ WINDOW_NAME = "Upper Limb Tracking"
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
 
-MODEL_PATH = (
-    Path(__file__).parent
-    / "models"
-    / "pose_landmarker_lite.task"
-)
+MODELS_DIRECTORY = Path(__file__).parent / "models"
+MODEL_PATHS = {
+    "full": MODELS_DIRECTORY / "pose_landmarker_full.task",
+    "lite": MODELS_DIRECTORY / "pose_landmarker_lite.task",
+}
+
+PREFERRED_MODEL = "full"
+DEFAULT_MIN_VISIBILITY = 0.55
+
+
+def select_model_path(preferred_model=PREFERRED_MODEL):
+    """
+    Prefer the Full model when it is available, but keep the project runnable
+    with the existing Lite model.
+    """
+    preferred_path = MODEL_PATHS.get(preferred_model)
+
+    if preferred_path is not None and preferred_path.exists():
+        return preferred_model, preferred_path
+
+    for variant in ("full", "lite"):
+        path = MODEL_PATHS[variant]
+        if path.exists():
+            return variant, path
+
+    expected = ", ".join(
+        str(path) for path in MODEL_PATHS.values()
+    )
+    raise FileNotFoundError(
+        "No Pose Landmarker model was found. Expected one of: "
+        f"{expected}"
+    )
 
 
 class PoseTracker:
-    """Detects shoulders, elbows and wrists with MediaPipe Pose Landmarker."""
+    """Detect shoulders, elbows and wrists with MediaPipe Pose Landmarker."""
 
-    def __init__(self):
-        if not MODEL_PATH.exists():
-            raise FileNotFoundError(
-                f"Model not found: {MODEL_PATH}"
-            )
+    def __init__(self, preferred_model=PREFERRED_MODEL):
+        self.model_variant, self.model_path = select_model_path(
+            preferred_model
+        )
 
         base_options = python.BaseOptions(
-            model_asset_path=str(MODEL_PATH)
+            model_asset_path=str(self.model_path)
         )
 
         options = vision.PoseLandmarkerOptions(
@@ -133,7 +159,7 @@ def resize_and_crop(frame, target_width, target_height):
 
 
 def mirror_landmarks_for_display(landmarks, frame_width):
-    """Mirror only landmark coordinates used for drawing."""
+    """Mirror only coordinates used for display; keep anatomical names."""
     mirrored = {}
 
     for name, point in landmarks.items():
@@ -144,6 +170,55 @@ def mirror_landmarks_for_display(landmarks, frame_width):
         )
 
     return mirrored
+
+
+def get_arm_quality(
+    landmarks,
+    arm,
+    min_visibility=DEFAULT_MIN_VISIBILITY,
+):
+    """
+    Check the three landmarks required for one upper limb.
+
+    No comparison with the opposite arm is made. Each arm is evaluated from
+    its own shoulder, elbow and wrist visibility values.
+    """
+    names = [
+        f"{arm}_shoulder",
+        f"{arm}_elbow",
+        f"{arm}_wrist",
+    ]
+
+    missing = [
+        name for name in names
+        if name not in landmarks
+    ]
+
+    if missing:
+        return {
+            "reliable": False,
+            "missing": missing,
+            "min_visibility": 0.0,
+            "mean_visibility": 0.0,
+            "visibilities": {},
+        }
+
+    visibilities = {
+        name: float(landmarks[name].get("visibility", 0.0))
+        for name in names
+    }
+
+    values = list(visibilities.values())
+    minimum = min(values)
+    mean = sum(values) / len(values)
+
+    return {
+        "reliable": minimum >= min_visibility,
+        "missing": [],
+        "min_visibility": minimum,
+        "mean_visibility": mean,
+        "visibilities": visibilities,
+    }
 
 
 def draw_point(
@@ -208,70 +283,91 @@ def draw_label(
     )
 
 
+def draw_selected_arm(
+    frame,
+    landmarks,
+    arm,
+    min_visibility=DEFAULT_MIN_VISIBILITY,
+):
+    """
+    Draw only the arm currently used by the task.
+
+    Low-visibility points are not drawn as valid landmarks. This avoids making
+    an inactive or poorly estimated opposite arm look like a requirement for
+    the selected arm.
+    """
+    shoulder_name = f"{arm}_shoulder"
+    elbow_name = f"{arm}_elbow"
+    wrist_name = f"{arm}_wrist"
+
+    shoulder = landmarks.get(shoulder_name)
+    elbow = landmarks.get(elbow_name)
+    wrist = landmarks.get(wrist_name)
+
+    shoulder_ok = (
+        shoulder is not None
+        and shoulder.get("visibility", 0.0) >= min_visibility
+    )
+    elbow_ok = (
+        elbow is not None
+        and elbow.get("visibility", 0.0) >= min_visibility
+    )
+    wrist_ok = (
+        wrist is not None
+        and wrist.get("visibility", 0.0) >= min_visibility
+    )
+
+    if shoulder_ok and elbow_ok:
+        draw_line(frame, shoulder, elbow)
+
+    if elbow_ok and wrist_ok:
+        draw_line(frame, elbow, wrist)
+
+    if shoulder_ok:
+        draw_point(frame, shoulder, radius=9, color=(0, 255, 0))
+
+    if elbow_ok:
+        draw_point(frame, elbow, radius=9, color=(0, 255, 0))
+
+    if wrist_ok:
+        wrist_color = (
+            (0, 0, 255)
+            if arm == "right"
+            else (255, 0, 0)
+        )
+
+        draw_point(
+            frame,
+            wrist,
+            radius=18,
+            color=wrist_color,
+        )
+
+        draw_label(
+            frame,
+            f"{arm.capitalize()} wrist",
+            wrist,
+        )
+
+
 def draw_upper_limb_skeleton(frame, landmarks):
-    """Draw both upper limbs."""
-
-    connections = [
-        ("left_shoulder", "left_elbow"),
-        ("left_elbow", "left_wrist"),
-        ("right_shoulder", "right_elbow"),
-        ("right_elbow", "right_wrist"),
-    ]
-
-    for point_a_name, point_b_name in connections:
-        if (
-            point_a_name in landmarks
-            and point_b_name in landmarks
-        ):
-            draw_line(
-                frame,
-                landmarks[point_a_name],
-                landmarks[point_b_name],
-            )
-
-    for point_name in [
-        "left_shoulder",
-        "right_shoulder",
-        "left_elbow",
-        "right_elbow",
-    ]:
-        if point_name in landmarks:
-            draw_point(
-                frame,
-                landmarks[point_name],
-                radius=9,
-                color=(0, 255, 0),
-            )
-
-    if "left_wrist" in landmarks:
-        draw_point(
-            frame,
-            landmarks["left_wrist"],
-            radius=18,
-            color=(255, 0, 0),
-        )
-        draw_label(
-            frame,
-            "Left wrist",
-            landmarks["left_wrist"],
-        )
-
-    if "right_wrist" in landmarks:
-        draw_point(
-            frame,
-            landmarks["right_wrist"],
-            radius=18,
-            color=(0, 0, 255),
-        )
-        draw_label(
-            frame,
-            "Right wrist",
-            landmarks["right_wrist"],
-        )
+    """Draw both arms. Kept mainly for the standalone tracking preview."""
+    draw_selected_arm(
+        frame,
+        landmarks,
+        "left",
+        min_visibility=0.0,
+    )
+    draw_selected_arm(
+        frame,
+        landmarks,
+        "right",
+        min_visibility=0.0,
+    )
 
 
 def run_tracking_preview():
-    """Run upper-limb tracking with mirrored view and readable labels."""
+    """Run upper-limb tracking with mirror-like display."""
 
     camera = cv2.VideoCapture(
         0,
@@ -295,7 +391,8 @@ def run_tracking_preview():
 
     cv2.namedWindow(
         WINDOW_NAME,
-        cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO,
+        cv2.WINDOW_NORMAL
+        | cv2.WINDOW_FREERATIO,
     )
     cv2.resizeWindow(
         WINDOW_NAME,
@@ -304,7 +401,7 @@ def run_tracking_preview():
     )
 
     print()
-    print("Pose tracking started.")
+    print(f"Pose tracking started with {tracker.model_variant} model.")
     print("Press Q to quit.")
     print()
 
@@ -327,25 +424,21 @@ def run_tracking_preview():
                 * 1000
             )
 
-            # Analyze the original frame so left/right keep anatomical meaning.
             landmarks = tracker.process_frame(
                 frame,
                 timestamp_ms,
             )
 
-            # Mirror only the image shown to the user.
             display_frame = cv2.flip(
                 frame,
                 1,
             )
 
-            # Mirror only landmark X coordinates for drawing.
             display_landmarks = mirror_landmarks_for_display(
                 landmarks,
                 DISPLAY_WIDTH,
             )
 
-            # Draw after mirroring so labels stay readable.
             draw_upper_limb_skeleton(
                 display_frame,
                 display_landmarks,
@@ -353,10 +446,10 @@ def run_tracking_preview():
 
             cv2.putText(
                 display_frame,
-                "Upper Limb Tracking",
+                f"Upper Limb Tracking - model: {tracker.model_variant}",
                 (25, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1,
+                0.85,
                 (255, 255, 255),
                 2,
                 cv2.LINE_AA,

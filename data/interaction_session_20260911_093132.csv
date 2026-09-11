@@ -1,0 +1,5 @@
+trial,arm,arm_trial,target_index,target_x,target_y,hold_time_seconds,min_arm_visibility,mean_arm_visibility,pose_model,completed_at
+1,right,1,1,580,308,1.089,0.984,0.99,full,2026-09-11T09:32:35
+2,right,2,2,879,325,1.069,0.982,0.989,full,2026-09-11T09:32:40
+3,left,1,1,361,328,1.07,0.94,0.972,full,2026-09-11T09:33:26
+4,left,2,2,820,342,1.08,0.934,0.965,full,2026-09-11T09:33:30
