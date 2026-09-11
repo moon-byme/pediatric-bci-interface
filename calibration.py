@@ -1,3 +1,4 @@
+import math
 import statistics
 import time
 
@@ -25,9 +26,12 @@ CALIBRATION_STAGES = [
     ),
 ]
 
+DEFAULT_USABLE_RATIO = 0.85
+MIN_PROJECTED_ARM_SCALE = 40.0
+
 
 class EMAFilter:
-    """Simple exponential moving average for 2D interaction coordinates."""
+    """Exponential moving average for a 2D signal."""
 
     def __init__(self, alpha=0.25):
         self.alpha = alpha
@@ -52,12 +56,138 @@ class EMAFilter:
                 + (1.0 - self.alpha) * self.y
             )
 
-        return int(self.x), int(self.y)
+        return self.x, self.y
+
+
+class ShoulderReferenceFilter:
+    """Smooth the shoulder anchor and projected arm scale independently."""
+
+    def __init__(self, alpha=0.20):
+        self.alpha = alpha
+        self.shoulder_x = None
+        self.shoulder_y = None
+        self.arm_scale = None
+
+    def reset(self):
+        self.shoulder_x = None
+        self.shoulder_y = None
+        self.arm_scale = None
+
+    def update(self, shoulder_x, shoulder_y, arm_scale):
+        if self.shoulder_x is None:
+            self.shoulder_x = float(shoulder_x)
+            self.shoulder_y = float(shoulder_y)
+            self.arm_scale = float(arm_scale)
+        else:
+            self.shoulder_x = (
+                self.alpha * float(shoulder_x)
+                + (1.0 - self.alpha) * self.shoulder_x
+            )
+            self.shoulder_y = (
+                self.alpha * float(shoulder_y)
+                + (1.0 - self.alpha) * self.shoulder_y
+            )
+            self.arm_scale = (
+                self.alpha * float(arm_scale)
+                + (1.0 - self.alpha) * self.arm_scale
+            )
+
+        return {
+            "shoulder_x": self.shoulder_x,
+            "shoulder_y": self.shoulder_y,
+            "arm_scale": self.arm_scale,
+        }
+
+
+def get_shoulder_relative_state(landmarks, arm):
+    """
+    Express the selected wrist relative to the selected shoulder.
+
+    The 2D offset is normalized by the projected arm-chain length
+    (shoulder->elbow + elbow->wrist). This makes interaction less dependent
+    on the participant's absolute location in the camera frame and partially
+    compensates for image scale.
+
+    This is an engineering coordinate system for interaction, not a clinical
+    biomechanical measurement.
+    """
+
+    shoulder = landmarks.get(f"{arm}_shoulder")
+    elbow = landmarks.get(f"{arm}_elbow")
+    wrist = landmarks.get(f"{arm}_wrist")
+
+    if shoulder is None or elbow is None or wrist is None:
+        return None
+
+    shoulder_x = float(shoulder["pixel_x"])
+    shoulder_y = float(shoulder["pixel_y"])
+    elbow_x = float(elbow["pixel_x"])
+    elbow_y = float(elbow["pixel_y"])
+    wrist_x = float(wrist["pixel_x"])
+    wrist_y = float(wrist["pixel_y"])
+
+    upper_arm = math.hypot(
+        elbow_x - shoulder_x,
+        elbow_y - shoulder_y,
+    )
+    forearm = math.hypot(
+        wrist_x - elbow_x,
+        wrist_y - elbow_y,
+    )
+
+    arm_scale = upper_arm + forearm
+
+    if arm_scale < MIN_PROJECTED_ARM_SCALE:
+        return None
+
+    relative_x = (
+        wrist_x - shoulder_x
+    ) / arm_scale
+    relative_y = (
+        wrist_y - shoulder_y
+    ) / arm_scale
+
+    return {
+        "relative_x": relative_x,
+        "relative_y": relative_y,
+        "shoulder_x": shoulder_x,
+        "shoulder_y": shoulder_y,
+        "arm_scale": arm_scale,
+        "wrist_x": wrist_x,
+        "wrist_y": wrist_y,
+    }
+
+
+def relative_to_screen(
+    relative_x,
+    relative_y,
+    reference,
+):
+    """Project one shoulder-relative point back into display coordinates."""
+
+    if reference is None:
+        return None
+
+    x = (
+        reference["shoulder_x"]
+        + relative_x * reference["arm_scale"]
+    )
+    y = (
+        reference["shoulder_y"]
+        + relative_y * reference["arm_scale"]
+    )
+
+    return int(round(x)), int(round(y))
 
 
 class ArmWorkspaceCalibrator:
     """
-    Estimate one arm's comfortable 2D interaction workspace.
+    Estimate one arm's comfortable shoulder-relative interaction workspace.
+
+    Five positions are collected (neutral + four cardinal directions). The
+    resulting workspace is stored in shoulder-relative units, not absolute
+    screen pixels. A conservative usable workspace is then obtained by
+    shrinking each directional extent toward the neutral point.
 
     This is an interface calibration, not a clinical measurement of joint ROM.
     """
@@ -67,10 +197,12 @@ class ArmWorkspaceCalibrator:
         capture_duration=0.7,
         min_samples=8,
         min_visibility=0.55,
+        usable_ratio=DEFAULT_USABLE_RATIO,
     ):
         self.capture_duration = capture_duration
         self.min_samples = min_samples
         self.min_visibility = min_visibility
+        self.usable_ratio = usable_ratio
         self.reset()
 
     def reset(self):
@@ -124,7 +256,7 @@ class ArmWorkspaceCalibrator:
         elapsed = time.perf_counter() - self.capture_start
         return min(elapsed / self.capture_duration, 1.0)
 
-    def update(self, wrist, arm_reliable=True):
+    def update(self, relative_state, arm_reliable=True):
         """
         Add one sample only when the selected arm is considered reliable.
 
@@ -134,15 +266,16 @@ class ArmWorkspaceCalibrator:
         if not self.capturing:
             return None
 
-        if (
-            arm_reliable
-            and wrist is not None
-            and wrist.get("visibility", 0.0) >= self.min_visibility
-        ):
+        if arm_reliable and relative_state is not None:
             self.samples.append(
                 (
-                    wrist["pixel_x"],
-                    wrist["pixel_y"],
+                    relative_state["relative_x"],
+                    relative_state["relative_y"],
+                    relative_state["shoulder_x"],
+                    relative_state["shoulder_y"],
+                    relative_state["arm_scale"],
+                    relative_state["wrist_x"],
+                    relative_state["wrist_y"],
                 )
             )
 
@@ -161,12 +294,16 @@ class ArmWorkspaceCalibrator:
             )
             return "retry"
 
-        xs = [sample[0] for sample in self.samples]
-        ys = [sample[1] for sample in self.samples]
+        columns = list(zip(*self.samples))
 
         point = {
-            "x": int(statistics.median(xs)),
-            "y": int(statistics.median(ys)),
+            "relative_x": float(statistics.median(columns[0])),
+            "relative_y": float(statistics.median(columns[1])),
+            "capture_shoulder_x": float(statistics.median(columns[2])),
+            "capture_shoulder_y": float(statistics.median(columns[3])),
+            "capture_arm_scale": float(statistics.median(columns[4])),
+            "capture_wrist_x": float(statistics.median(columns[5])),
+            "capture_wrist_y": float(statistics.median(columns[6])),
             "sample_count": len(self.samples),
         }
 
@@ -186,67 +323,172 @@ class ArmWorkspaceCalibrator:
         return "captured"
 
     def get_workspace(self):
+        """Return the full comfortable workspace in shoulder-relative units."""
         if not self.complete:
             return None
 
-        left_x = self.points["left"]["x"]
-        right_x = self.points["right"]["x"]
-        up_y = self.points["up"]["y"]
-        down_y = self.points["down"]["y"]
+        center_x = self.points["center"]["relative_x"]
+        center_y = self.points["center"]["relative_y"]
 
-        min_x = min(left_x, right_x)
-        max_x = max(left_x, right_x)
-        min_y = min(up_y, down_y)
-        max_y = max(up_y, down_y)
+        min_x = min(
+            self.points["left"]["relative_x"],
+            center_x,
+            self.points["right"]["relative_x"],
+        )
+        max_x = max(
+            self.points["left"]["relative_x"],
+            center_x,
+            self.points["right"]["relative_x"],
+        )
+        min_y = min(
+            self.points["up"]["relative_y"],
+            center_y,
+            self.points["down"]["relative_y"],
+        )
+        max_y = max(
+            self.points["up"]["relative_y"],
+            center_y,
+            self.points["down"]["relative_y"],
+        )
 
         return {
+            "coordinate_system": "shoulder_relative_arm_length_normalized_2d",
             "min_x": min_x,
             "max_x": max_x,
             "min_y": min_y,
             "max_y": max_y,
+            "center_x": center_x,
+            "center_y": center_y,
             "width": max_x - min_x,
             "height": max_y - min_y,
-            "center_x": self.points["center"]["x"],
-            "center_y": self.points["center"]["y"],
         }
 
-    def map_target(
-        self,
-        normalized_x,
-        normalized_y,
-        safe_margin=0.08,
-    ):
-        """Map 0..1 target coordinates into this arm's workspace."""
+    def get_usable_workspace(self):
+        """
+        Return a conservative inner workspace.
+
+        Each directional extent is reduced independently toward the neutral
+        position. This preserves left/right and up/down asymmetry.
+        """
         workspace = self.get_workspace()
 
         if workspace is None:
             return None
 
-        usable_ratio = 1.0 - 2.0 * safe_margin
+        cx = workspace["center_x"]
+        cy = workspace["center_y"]
+        ratio = self.usable_ratio
 
-        nx = safe_margin + normalized_x * usable_ratio
-        ny = safe_margin + normalized_y * usable_ratio
+        min_x = cx - (
+            cx - workspace["min_x"]
+        ) * ratio
+        max_x = cx + (
+            workspace["max_x"] - cx
+        ) * ratio
+        min_y = cy - (
+            cy - workspace["min_y"]
+        ) * ratio
+        max_y = cy + (
+            workspace["max_y"] - cy
+        ) * ratio
 
-        x = workspace["min_x"] + nx * workspace["width"]
-        y = workspace["min_y"] + ny * workspace["height"]
+        return {
+            "coordinate_system": workspace["coordinate_system"],
+            "usable_ratio": ratio,
+            "min_x": min_x,
+            "max_x": max_x,
+            "min_y": min_y,
+            "max_y": max_y,
+            "center_x": cx,
+            "center_y": cy,
+            "width": max_x - min_x,
+            "height": max_y - min_y,
+        }
 
-        return int(x), int(y)
+    def get_usable_cardinal_points(self):
+        """Return the inner reach envelope as up/right/down/left points."""
+        workspace = self.get_usable_workspace()
+
+        if workspace is None:
+            return None
+
+        cx = workspace["center_x"]
+        cy = workspace["center_y"]
+
+        return {
+            "center": (cx, cy),
+            "left": (workspace["min_x"], cy),
+            "right": (workspace["max_x"], cy),
+            "up": (cx, workspace["min_y"]),
+            "down": (cx, workspace["max_y"]),
+        }
+
+    def map_target_relative(
+        self,
+        normalized_x,
+        normalized_y,
+    ):
+        """
+        Map a logical 0..1 target into the conservative usable workspace.
+
+        The mapping is neutral-centered and asymmetric: each direction uses
+        the participant's own calibrated extent. Logical target positions are
+        expected to remain inside a diamond-like envelope around the center;
+        points outside it are conservatively projected back onto that envelope.
+        """
+        workspace = self.get_usable_workspace()
+
+        if workspace is None:
+            return None
+
+        signed_x = 2.0 * float(normalized_x) - 1.0
+        signed_y = 2.0 * float(normalized_y) - 1.0
+
+        l1_radius = abs(signed_x) + abs(signed_y)
+        if l1_radius > 1.0:
+            signed_x /= l1_radius
+            signed_y /= l1_radius
+
+        cx = workspace["center_x"]
+        cy = workspace["center_y"]
+
+        if signed_x < 0:
+            relative_x = cx + signed_x * (
+                cx - workspace["min_x"]
+            )
+        else:
+            relative_x = cx + signed_x * (
+                workspace["max_x"] - cx
+            )
+
+        if signed_y < 0:
+            relative_y = cy + signed_y * (
+                cy - workspace["min_y"]
+            )
+        else:
+            relative_y = cy + signed_y * (
+                workspace["max_y"] - cy
+            )
+
+        return relative_x, relative_y
 
 
 class BilateralWorkspaceManager:
-    """Keep independent calibrations for the right and left arms."""
+    """Keep independent shoulder-relative calibrations for both arms."""
 
     def __init__(
         self,
         capture_duration=0.7,
         min_samples=8,
         min_visibility=0.55,
+        usable_ratio=DEFAULT_USABLE_RATIO,
     ):
         self.calibrators = {
             arm: ArmWorkspaceCalibrator(
                 capture_duration=capture_duration,
                 min_samples=min_samples,
                 min_visibility=min_visibility,
+                usable_ratio=usable_ratio,
             )
             for arm in ("right", "left")
         }

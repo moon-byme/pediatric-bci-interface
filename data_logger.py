@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 class TrialLogger:
-    """Store arm-specific calibration metadata and completed trials."""
+    """Store shoulder-relative calibration metadata and completed trials."""
 
     def __init__(self, data_directory=None):
         if data_directory is None:
@@ -43,9 +43,12 @@ class TrialLogger:
                     "arm",
                     "arm_trial",
                     "target_index",
-                    "target_x",
-                    "target_y",
+                    "target_screen_x",
+                    "target_screen_y",
+                    "target_relative_x",
+                    "target_relative_y",
                     "hold_time_seconds",
+                    "arm_scale_px",
                     "min_arm_visibility",
                     "mean_arm_visibility",
                     "pose_model",
@@ -59,9 +62,13 @@ class TrialLogger:
                 "created_at": datetime.now().isoformat(
                     timespec="seconds"
                 ),
+                "coordinate_system": (
+                    "2D shoulder-relative wrist offsets normalized by "
+                    "projected arm-chain length (shoulder-elbow + elbow-wrist)"
+                ),
                 "note": (
-                    "Independent comfortable interaction workspaces for each arm; "
-                    "not clinical joint-ROM measurements."
+                    "Independent interaction workspaces for each arm; "
+                    "engineering calibration only, not a clinical ROM measure."
                 ),
                 "arms": {},
             }
@@ -96,7 +103,9 @@ class TrialLogger:
         self,
         arm,
         calibration_points,
-        workspace,
+        comfortable_workspace,
+        usable_workspace,
+        usable_ratio,
         pose_model,
     ):
         payload = self._read_calibration_payload()
@@ -107,8 +116,10 @@ class TrialLogger:
                 timespec="seconds"
             ),
             "pose_model": pose_model,
+            "usable_ratio": usable_ratio,
             "calibration_points": calibration_points,
-            "workspace": workspace,
+            "comfortable_workspace_relative": comfortable_workspace,
+            "usable_workspace_relative": usable_workspace,
         }
 
         self._write_calibration_payload(payload)
@@ -119,9 +130,12 @@ class TrialLogger:
         arm,
         arm_trial,
         target_index,
-        target_x,
-        target_y,
+        target_screen_x,
+        target_screen_y,
+        target_relative_x,
+        target_relative_y,
         hold_time_seconds,
+        arm_scale_px,
         min_arm_visibility,
         mean_arm_visibility,
         pose_model,
@@ -138,9 +152,12 @@ class TrialLogger:
                     arm,
                     arm_trial,
                     target_index,
-                    target_x,
-                    target_y,
+                    target_screen_x,
+                    target_screen_y,
+                    round(target_relative_x, 6),
+                    round(target_relative_y, 6),
                     round(hold_time_seconds, 3),
+                    round(arm_scale_px, 3),
                     round(min_arm_visibility, 3),
                     round(mean_arm_visibility, 3),
                     pose_model,

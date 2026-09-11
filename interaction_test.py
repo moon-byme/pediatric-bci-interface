@@ -6,6 +6,9 @@ import cv2
 from calibration import (
     BilateralWorkspaceManager,
     EMAFilter,
+    ShoulderReferenceFilter,
+    get_shoulder_relative_state,
+    relative_to_screen,
 )
 from data_logger import TrialLogger
 from pose_tracking import (
@@ -21,16 +24,24 @@ from pose_tracking import (
 
 WINDOW_NAME = "Upper Limb Interaction Test"
 DWELL_TIME = 1.0
-TARGET_RADIUS = 55
 MIN_VISIBILITY = 0.55
 SMOOTHING_ALPHA = 0.25
+REFERENCE_SMOOTHING_ALPHA = 0.20
+USABLE_WORKSPACE_RATIO = 0.85
+TARGET_RADIUS_ARM_RATIO = 0.12
+MIN_TARGET_RADIUS = 40
+MAX_TARGET_RADIUS = 72
 
-# Logical target positions inside EACH ARM'S independently calibrated workspace.
+# Logical positions inside the participant-specific usable workspace.
+# These positions stay inside a conservative diamond-like envelope rather
+# than assuming the four corners of a rectangular workspace are reachable.
 TARGET_POSITIONS = [
-    (0.20, 0.25),
-    (0.80, 0.30),
-    (0.75, 0.75),
-    (0.30, 0.72),
+    (0.50, 0.20),
+    (0.80, 0.50),
+    (0.50, 0.80),
+    (0.20, 0.50),
+    (0.68, 0.32),
+    (0.32, 0.68),
     (0.50, 0.50),
 ]
 
@@ -55,11 +66,21 @@ class InteractionTest:
             capture_duration=0.7,
             min_samples=8,
             min_visibility=MIN_VISIBILITY,
+            usable_ratio=USABLE_WORKSPACE_RATIO,
         )
 
-        self.wrist_filters = {
+        self.relative_wrist_filters = {
             "right": EMAFilter(alpha=SMOOTHING_ALPHA),
             "left": EMAFilter(alpha=SMOOTHING_ALPHA),
+        }
+
+        self.reference_filters = {
+            "right": ShoulderReferenceFilter(
+                alpha=REFERENCE_SMOOTHING_ALPHA
+            ),
+            "left": ShoulderReferenceFilter(
+                alpha=REFERENCE_SMOOTHING_ALPHA
+            ),
         }
 
         self.last_quality = self.empty_quality()
@@ -79,30 +100,20 @@ class InteractionTest:
         return self.workspaces.get(self.arm)
 
     @property
-    def wrist_filter(self):
-        return self.wrist_filters[self.arm]
+    def relative_wrist_filter(self):
+        return self.relative_wrist_filters[self.arm]
 
     @property
-    def wrist_name(self):
-        return f"{self.arm}_wrist"
+    def reference_filter(self):
+        return self.reference_filters[self.arm]
 
     @property
     def is_calibrated(self):
         return self.workspaces.is_complete(self.arm)
 
-    def get_target_center(self):
-        if not self.is_calibrated:
-            return None
-
-        normalized_x, normalized_y = TARGET_POSITIONS[
-            self.target_index
-        ]
-
-        return self.calibrator.map_target(
-            normalized_x,
-            normalized_y,
-            safe_margin=0.08,
-        )
+    def reset_filters(self):
+        self.relative_wrist_filter.reset()
+        self.reference_filter.reset()
 
     def set_arm(self, arm):
         if arm not in {"left", "right"}:
@@ -115,11 +126,11 @@ class InteractionTest:
         self.target_index = 0
         self.hover_start = None
         self.success_time = None
-        self.wrist_filter.reset()
+        self.reset_filters()
 
     def restart_current_calibration(self):
         self.workspaces.reset_arm(self.arm)
-        self.wrist_filter.reset()
+        self.reset_filters()
         self.target_index = 0
         self.hover_start = None
         self.success_time = None
@@ -138,27 +149,66 @@ class InteractionTest:
         self.hover_start = None
         self.success_time = None
 
-    def update_calibration(
-        self,
-        display_landmarks,
-        arm_quality,
-    ):
-        wrist = display_landmarks.get(
-            self.wrist_name
+    def get_current_reference(self, relative_state):
+        if relative_state is None:
+            return None
+
+        return self.reference_filter.update(
+            relative_state["shoulder_x"],
+            relative_state["shoulder_y"],
+            relative_state["arm_scale"],
         )
 
+    def get_target_relative(self):
+        if not self.is_calibrated:
+            return None
+
+        logical_x, logical_y = TARGET_POSITIONS[
+            self.target_index
+        ]
+
+        return self.calibrator.map_target_relative(
+            logical_x,
+            logical_y,
+        )
+
+    def get_target_radius(self, reference):
+        if reference is None:
+            return MIN_TARGET_RADIUS
+
+        radius = int(
+            reference["arm_scale"]
+            * TARGET_RADIUS_ARM_RATIO
+        )
+
+        return max(
+            MIN_TARGET_RADIUS,
+            min(MAX_TARGET_RADIUS, radius),
+        )
+
+    def update_calibration(
+        self,
+        relative_state,
+        arm_quality,
+    ):
         event = self.calibrator.update(
-            wrist,
+            relative_state,
             arm_reliable=arm_quality["reliable"],
         )
 
         if event == "complete":
-            self.wrist_filter.reset()
+            self.reset_filters()
 
             self.logger.save_arm_calibration(
                 arm=self.arm,
                 calibration_points=self.calibrator.points,
-                workspace=self.calibrator.get_workspace(),
+                comfortable_workspace=(
+                    self.calibrator.get_workspace()
+                ),
+                usable_workspace=(
+                    self.calibrator.get_usable_workspace()
+                ),
+                usable_ratio=USABLE_WORKSPACE_RATIO,
                 pose_model=self.pose_model,
             )
 
@@ -166,7 +216,7 @@ class InteractionTest:
 
     def update_interaction(
         self,
-        display_landmarks,
+        relative_state,
         arm_quality,
     ):
         if self.success_time is not None:
@@ -177,47 +227,95 @@ class InteractionTest:
             ):
                 self.next_target()
 
-            return 1.0, None
+            return {
+                "progress": 1.0,
+                "interaction_point": None,
+                "target_center": None,
+                "target_relative": None,
+                "reference": None,
+                "target_radius": MIN_TARGET_RADIUS,
+            }
 
-        if not arm_quality["reliable"]:
+        if (
+            not arm_quality["reliable"]
+            or relative_state is None
+        ):
             self.hover_start = None
-            self.wrist_filter.reset()
-            return 0.0, None
+            self.reset_filters()
 
-        wrist = display_landmarks.get(
-            self.wrist_name
+            return {
+                "progress": 0.0,
+                "interaction_point": None,
+                "target_center": None,
+                "target_relative": None,
+                "reference": None,
+                "target_radius": MIN_TARGET_RADIUS,
+            }
+
+        reference = self.get_current_reference(
+            relative_state
         )
 
-        if wrist is None:
-            self.hover_start = None
-            self.wrist_filter.reset()
-            return 0.0, None
-
-        interaction_x, interaction_y = self.wrist_filter.update(
-            wrist["pixel_x"],
-            wrist["pixel_y"],
-        )
-
-        target_center = self.get_target_center()
-
-        if target_center is None:
-            return 0.0, (
-                interaction_x,
-                interaction_y,
+        relative_x, relative_y = (
+            self.relative_wrist_filter.update(
+                relative_state["relative_x"],
+                relative_state["relative_y"],
             )
+        )
 
-        target_x, target_y = target_center
+        interaction_point = relative_to_screen(
+            relative_x,
+            relative_y,
+            reference,
+        )
+
+        target_relative = self.get_target_relative()
+
+        if target_relative is None:
+            return {
+                "progress": 0.0,
+                "interaction_point": interaction_point,
+                "target_center": None,
+                "target_relative": None,
+                "reference": reference,
+                "target_radius": self.get_target_radius(reference),
+            }
+
+        target_relative_x, target_relative_y = (
+            target_relative
+        )
+
+        target_center = relative_to_screen(
+            target_relative_x,
+            target_relative_y,
+            reference,
+        )
+
+        target_radius = self.get_target_radius(
+            reference
+        )
+
+        # Compare in shoulder-relative, arm-length-normalized space.
+        # The target radius is converted back to the same normalized unit.
+        relative_radius = (
+            target_radius
+            / max(reference["arm_scale"], 1.0)
+        )
 
         distance = math.hypot(
-            interaction_x - target_x,
-            interaction_y - target_y,
+            relative_x - target_relative_x,
+            relative_y - target_relative_y,
         )
 
-        if distance <= TARGET_RADIUS:
+        if distance <= relative_radius:
             if self.hover_start is None:
                 self.hover_start = time.perf_counter()
 
-            elapsed = time.perf_counter() - self.hover_start
+            elapsed = (
+                time.perf_counter()
+                - self.hover_start
+            )
+
             progress = min(
                 elapsed / DWELL_TIME,
                 1.0,
@@ -231,27 +329,44 @@ class InteractionTest:
                 self.logger.log_success(
                     trial=self.total_completed_trials,
                     arm=self.arm,
-                    arm_trial=self.arm_completed_trials[self.arm],
+                    arm_trial=(
+                        self.arm_completed_trials[self.arm]
+                    ),
                     target_index=self.target_index + 1,
-                    target_x=target_x,
-                    target_y=target_y,
+                    target_screen_x=target_center[0],
+                    target_screen_y=target_center[1],
+                    target_relative_x=target_relative_x,
+                    target_relative_y=target_relative_y,
                     hold_time_seconds=elapsed,
-                    min_arm_visibility=arm_quality["min_visibility"],
-                    mean_arm_visibility=arm_quality["mean_visibility"],
+                    arm_scale_px=reference["arm_scale"],
+                    min_arm_visibility=(
+                        arm_quality["min_visibility"]
+                    ),
+                    mean_arm_visibility=(
+                        arm_quality["mean_visibility"]
+                    ),
                     pose_model=self.pose_model,
                 )
 
-            return progress, (
-                interaction_x,
-                interaction_y,
-            )
+            return {
+                "progress": progress,
+                "interaction_point": interaction_point,
+                "target_center": target_center,
+                "target_relative": target_relative,
+                "reference": reference,
+                "target_radius": target_radius,
+            }
 
         self.hover_start = None
 
-        return 0.0, (
-            interaction_x,
-            interaction_y,
-        )
+        return {
+            "progress": 0.0,
+            "interaction_point": interaction_point,
+            "target_center": target_center,
+            "target_relative": target_relative,
+            "reference": reference,
+            "target_radius": target_radius,
+        }
 
     def update(self, display_landmarks):
         arm_quality = get_arm_quality(
@@ -261,30 +376,52 @@ class InteractionTest:
         )
         self.last_quality = arm_quality
 
+        relative_state = None
+
+        if arm_quality["reliable"]:
+            relative_state = get_shoulder_relative_state(
+                display_landmarks,
+                self.arm,
+            )
+
         if not self.is_calibrated:
             calibration_progress = self.update_calibration(
-                display_landmarks,
+                relative_state,
                 arm_quality,
             )
+
+            reference = None
+            if relative_state is not None:
+                reference = {
+                    "shoulder_x": relative_state["shoulder_x"],
+                    "shoulder_y": relative_state["shoulder_y"],
+                    "arm_scale": relative_state["arm_scale"],
+                }
 
             return {
                 "mode": "calibration",
                 "progress": calibration_progress,
                 "interaction_point": None,
+                "target_center": None,
+                "target_relative": None,
+                "target_radius": MIN_TARGET_RADIUS,
                 "quality": arm_quality,
+                "reference": reference,
             }
 
-        dwell_progress, interaction_point = self.update_interaction(
-            display_landmarks,
+        interaction = self.update_interaction(
+            relative_state,
             arm_quality,
         )
 
-        return {
-            "mode": "interaction",
-            "progress": dwell_progress,
-            "interaction_point": interaction_point,
-            "quality": arm_quality,
-        }
+        interaction.update(
+            {
+                "mode": "interaction",
+                "quality": arm_quality,
+            }
+        )
+
+        return interaction
 
     def draw_tracking_status(self, frame, quality, y=145):
         if quality["reliable"]:
@@ -311,13 +448,136 @@ class InteractionTest:
             cv2.LINE_AA,
         )
 
+    def draw_relative_calibration_points(
+        self,
+        frame,
+        reference,
+    ):
+        if reference is None:
+            return
+
+        point_colors = {
+            "center": (255, 255, 0),
+            "left": (255, 180, 0),
+            "right": (0, 180, 255),
+            "up": (180, 255, 0),
+            "down": (255, 0, 180),
+        }
+
+        for name, point in self.calibrator.points.items():
+            screen_point = relative_to_screen(
+                point["relative_x"],
+                point["relative_y"],
+                reference,
+            )
+
+            cv2.circle(
+                frame,
+                screen_point,
+                12,
+                point_colors.get(
+                    name,
+                    (255, 255, 255),
+                ),
+                3,
+            )
+
+            cv2.putText(
+                frame,
+                name,
+                (
+                    screen_point[0] + 14,
+                    screen_point[1] - 10,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+    def draw_workspace_polygon(
+        self,
+        frame,
+        reference,
+        usable,
+        color,
+        label,
+    ):
+        if reference is None:
+            return
+
+        if usable:
+            points = self.calibrator.get_usable_cardinal_points()
+        else:
+            workspace = self.calibrator.get_workspace()
+            if workspace is None:
+                return
+
+            cx = workspace["center_x"]
+            cy = workspace["center_y"]
+            points = {
+                "up": (cx, workspace["min_y"]),
+                "right": (workspace["max_x"], cy),
+                "down": (cx, workspace["max_y"]),
+                "left": (workspace["min_x"], cy),
+            }
+
+        if points is None:
+            return
+
+        polygon = []
+        for name in ("up", "right", "down", "left"):
+            relative_x, relative_y = points[name]
+            polygon.append(
+                relative_to_screen(
+                    relative_x,
+                    relative_y,
+                    reference,
+                )
+            )
+
+        for index in range(len(polygon)):
+            point_a = polygon[index]
+            point_b = polygon[
+                (index + 1) % len(polygon)
+            ]
+
+            cv2.line(
+                frame,
+                point_a,
+                point_b,
+                color,
+                2,
+            )
+
+        label_x = min(point[0] for point in polygon)
+        label_y = min(point[1] for point in polygon)
+
+        cv2.putText(
+            frame,
+            label,
+            (
+                max(20, label_x),
+                max(25, label_y - 10),
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
     def draw_calibration(
         self,
         frame,
         display_landmarks,
-        progress,
-        quality,
+        state,
     ):
+        quality = state["quality"]
+        progress = state["progress"]
+        reference = state["reference"]
+
         draw_selected_arm(
             frame,
             display_landmarks,
@@ -377,36 +637,10 @@ class InteractionTest:
             y=140,
         )
 
-        point_colors = {
-            "center": (255, 255, 0),
-            "left": (255, 180, 0),
-            "right": (0, 180, 255),
-            "up": (180, 255, 0),
-            "down": (255, 0, 180),
-        }
-
-        for name, point in self.calibrator.points.items():
-            cv2.circle(
-                frame,
-                (point["x"], point["y"]),
-                12,
-                point_colors.get(name, (255, 255, 255)),
-                3,
-            )
-
-            cv2.putText(
-                frame,
-                name,
-                (
-                    point["x"] + 14,
-                    point["y"] - 10,
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+        self.draw_relative_calibration_points(
+            frame,
+            reference,
+        )
 
         if self.calibrator.capturing:
             bar_x = 30
@@ -480,10 +714,15 @@ class InteractionTest:
         self,
         frame,
         display_landmarks,
-        progress,
-        interaction_point,
-        quality,
+        state,
     ):
+        quality = state["quality"]
+        reference = state["reference"]
+        interaction_point = state["interaction_point"]
+        target_center = state["target_center"]
+        target_radius = state["target_radius"]
+        progress = state["progress"]
+
         draw_selected_arm(
             frame,
             display_landmarks,
@@ -491,46 +730,31 @@ class InteractionTest:
             min_visibility=MIN_VISIBILITY,
         )
 
-        workspace = self.calibrator.get_workspace()
+        # Raw comfortable reach envelope.
+        self.draw_workspace_polygon(
+            frame,
+            reference,
+            usable=False,
+            color=(255, 255, 0),
+            label=(
+                f"{self.arm.capitalize()} comfortable workspace"
+            ),
+        )
 
-        if workspace is not None:
-            cv2.rectangle(
-                frame,
-                (
-                    workspace["min_x"],
-                    workspace["min_y"],
-                ),
-                (
-                    workspace["max_x"],
-                    workspace["max_y"],
-                ),
-                (255, 255, 0),
-                2,
-            )
-
-            cv2.putText(
-                frame,
-                f"{self.arm.capitalize()} comfortable workspace",
-                (
-                    workspace["min_x"],
-                    max(25, workspace["min_y"] - 10),
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (255, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-
-        target_center = self.get_target_center()
+        # Conservative inner envelope used to place game targets.
+        self.draw_workspace_polygon(
+            frame,
+            reference,
+            usable=True,
+            color=(0, 255, 120),
+            label="Usable workspace (85%)",
+        )
 
         if target_center is not None:
-            target_x, target_y = target_center
-
             cv2.circle(
                 frame,
-                (target_x, target_y),
-                TARGET_RADIUS,
+                target_center,
+                target_radius,
                 (60, 190, 255),
                 4,
             )
@@ -543,10 +767,10 @@ class InteractionTest:
 
                 cv2.ellipse(
                     frame,
-                    (target_x, target_y),
+                    target_center,
                     (
-                        TARGET_RADIUS + 12,
-                        TARGET_RADIUS + 12,
+                        target_radius + 12,
+                        target_radius + 12,
                     ),
                     0,
                     start_angle,
@@ -559,9 +783,35 @@ class InteractionTest:
             cv2.circle(
                 frame,
                 interaction_point,
-                25,
+                22,
                 (255, 255, 255),
                 3,
+            )
+
+        if reference is not None:
+            shoulder_point = (
+                int(round(reference["shoulder_x"])),
+                int(round(reference["shoulder_y"])),
+            )
+            cv2.circle(
+                frame,
+                shoulder_point,
+                12,
+                (255, 0, 255),
+                2,
+            )
+            cv2.putText(
+                frame,
+                "shoulder origin",
+                (
+                    shoulder_point[0] + 15,
+                    shoulder_point[1] - 12,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (255, 0, 255),
+                1,
+                cv2.LINE_AA,
             )
 
         cv2.rectangle(
@@ -573,8 +823,8 @@ class InteractionTest:
         )
 
         title = (
-            f"{self.arm.capitalize()} arm: move the wrist to the target "
-            f"and hold for {DWELL_TIME:.1f}s"
+            f"{self.arm.capitalize()} arm: shoulder-relative target control | "
+            f"hold {DWELL_TIME:.1f}s"
         )
 
         cv2.putText(
@@ -582,14 +832,14 @@ class InteractionTest:
             title,
             (30, 45),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.72,
+            0.68,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
 
         controls = (
-            "R/L: switch arm | SPACE: next target | X: recalibrate selected arm | "
+            "R/L: switch arm | SPACE: next target | X: recalibrate | "
             "F: fullscreen | Q: quit"
         )
 
@@ -614,7 +864,7 @@ class InteractionTest:
             f"Total: {self.total_completed_trials} | "
             f"Right: {self.arm_completed_trials['right']} | "
             f"Left: {self.arm_completed_trials['left']} | "
-            f"Model: {self.pose_model}"
+            f"Model: {self.pose_model} | Useful: {int(USABLE_WORKSPACE_RATIO * 100)}%"
         )
 
         cv2.putText(
@@ -622,7 +872,7 @@ class InteractionTest:
             counter_text,
             (25, DISPLAY_HEIGHT - 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
+            0.54,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
@@ -663,17 +913,14 @@ class InteractionTest:
             self.draw_calibration(
                 frame,
                 display_landmarks,
-                state["progress"],
-                state["quality"],
+                state,
             )
             return
 
         self.draw_interaction(
             frame,
             display_landmarks,
-            state["progress"],
-            state["interaction_point"],
-            state["quality"],
+            state,
         )
 
     def toggle_fullscreen(self):
@@ -742,7 +989,11 @@ def run_interaction_test():
     print("Upper-limb interaction test started.")
     print(f"Pose model: {tracker.model_variant}")
     print("Right and left arms are calibrated independently.")
-    print("Only the selected arm is used for interaction quality checks.")
+    print("Interaction coordinates are relative to the selected shoulder.")
+    print(
+        f"Targets use {int(USABLE_WORKSPACE_RATIO * 100)}% "
+        "of each directional calibrated extent."
+    )
     print(f"Session data: {test.logger.file_path}")
     print()
 

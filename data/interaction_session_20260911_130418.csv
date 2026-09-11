@@ -1,0 +1,5 @@
+trial,arm,arm_trial,target_index,target_screen_x,target_screen_y,target_relative_x,target_relative_y,hold_time_seconds,arm_scale_px,min_arm_visibility,mean_arm_visibility,pose_model,completed_at
+1,right,1,1,978,266,0.158708,-0.494625,1.095,801.352,0.959,0.974,full,2026-09-11T13:05:24
+2,right,2,2,1040,263,0.20987,-0.494625,1.052,816.934,0.986,0.992,full,2026-09-11T13:05:27
+3,right,3,3,983,528,0.158708,-0.147041,1.087,875.149,0.979,0.99,full,2026-09-11T13:05:30
+4,right,4,4,578,159,-0.265014,-0.494625,1.114,943.452,0.986,0.992,full,2026-09-11T13:05:36

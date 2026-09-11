@@ -1,0 +1,88 @@
+{
+  "session_id": "20260911_130418",
+  "created_at": "2026-09-11T13:04:18",
+  "coordinate_system": "2D shoulder-relative wrist offsets normalized by projected arm-chain length (shoulder-elbow + elbow-wrist)",
+  "note": "Independent interaction workspaces for each arm; engineering calibration only, not a clinical ROM measure.",
+  "arms": {
+    "right": {
+      "saved_at": "2026-09-11T13:05:12",
+      "pose_model": "full",
+      "usable_ratio": 0.85,
+      "calibration_points": {
+        "center": {
+          "relative_x": 0.15870781844337042,
+          "relative_y": -0.4946246750961575,
+          "capture_shoulder_x": 840.0,
+          "capture_shoulder_y": 554.5,
+          "capture_arm_scale": 916.8442983544867,
+          "capture_wrist_x": 985.0,
+          "capture_wrist_y": 100.5,
+          "sample_count": 8
+        },
+        "left": {
+          "relative_x": -0.6721187886864384,
+          "relative_y": -0.3342582630357259,
+          "capture_shoulder_x": 798.0,
+          "capture_shoulder_y": 524.5,
+          "capture_arm_scale": 822.5078639188574,
+          "capture_wrist_x": 250.5,
+          "capture_wrist_y": 251.5,
+          "sample_count": 8
+        },
+        "right": {
+          "relative_x": 0.2590255366080285,
+          "relative_y": -0.3376414785082268,
+          "capture_shoulder_x": 818.5,
+          "capture_shoulder_y": 545.5,
+          "capture_arm_scale": 813.503471613978,
+          "capture_wrist_x": 1029.5,
+          "capture_wrist_y": 272.5,
+          "sample_count": 8
+        },
+        "up": {
+          "relative_x": 0.16076648784362857,
+          "relative_y": -0.43460514168946585,
+          "capture_shoulder_x": 853.0,
+          "capture_shoulder_y": 546.5,
+          "capture_arm_scale": 935.0006978505862,
+          "capture_wrist_x": 1002.0,
+          "capture_wrist_y": 139.0,
+          "sample_count": 8
+        },
+        "down": {
+          "relative_x": 0.35367704319283777,
+          "relative_y": 0.1869109771704086,
+          "capture_shoulder_x": 805.0,
+          "capture_shoulder_y": 546.0,
+          "capture_arm_scale": 650.661543314246,
+          "capture_wrist_x": 1034.0,
+          "capture_wrist_y": 670.0,
+          "sample_count": 8
+        }
+      },
+      "comfortable_workspace_relative": {
+        "coordinate_system": "shoulder_relative_arm_length_normalized_2d",
+        "min_x": -0.6721187886864384,
+        "max_x": 0.2590255366080285,
+        "min_y": -0.4946246750961575,
+        "max_y": 0.1869109771704086,
+        "center_x": 0.15870781844337042,
+        "center_y": -0.4946246750961575,
+        "width": 0.9311443252944669,
+        "height": 0.6815356522665661
+      },
+      "usable_workspace_relative": {
+        "coordinate_system": "shoulder_relative_arm_length_normalized_2d",
+        "usable_ratio": 0.85,
+        "min_x": -0.5474947976169671,
+        "max_x": 0.2439778788833298,
+        "min_y": -0.4946246750961575,
+        "max_y": 0.08468062933042364,
+        "center_x": 0.15870781844337042,
+        "center_y": -0.4946246750961575,
+        "width": 0.7914726765002968,
+        "height": 0.5793053044265811
+      }
+    }
+  }
+}
